@@ -21,6 +21,71 @@ public class ComputedJumpTests
     private static ComputedJump Jump(params uint[] targets) =>
         new() { Func = "Dispatch", TargetOffsets = [.. targets] };
 
+    private static Context ThumbDispatch(InputConfig input) => CreateContext(
+        [0x46C0, 0x469F, 0x2011, 0x4770, 0x2022, 0x4770],
+        [new Symbol(Base, 12, "Dispatch", IsThumb: true)], input);
+
+    private static ComputedJump ThumbJump(uint offset = 2, params uint[] targets) =>
+        new() { Func = "Dispatch", Offset = offset, TargetOffsets = [.. targets] };
+
+    [Fact]
+    public void ThumbFiniteDispatchAcceptsHalfwordAlignmentAndDeduplicatesCases()
+    {
+        var context = ThumbDispatch(new InputConfig { ComputedJumps = [ThumbJump(2, 4, 8, 8)] });
+        var analysis = FunctionAnalysis.Analyze(context, context.Functions[0]);
+
+        Assert.Empty(analysis.Errors);
+        Assert.Equal([Base + 4, Base + 8], analysis.Flows[Base + 2].Targets!);
+        Assert.False(analysis.Flows[Base + 2].PCRelativeTargets);
+        Assert.Equal(6, analysis.Instructions.Count);
+    }
+
+    [Fact]
+    public void AThumbTargetCanBeTheFinalHalfwordOfTheFunction()
+    {
+        var context = ThumbDispatch(new InputConfig { ComputedJumps = [ThumbJump(2, 10)] });
+        var analysis = FunctionAnalysis.Analyze(context, context.Functions[0]);
+
+        Assert.Empty(analysis.Errors);
+        Assert.Equal([Base + 10], analysis.Flows[Base + 2].Targets!);
+    }
+
+    [Theory]
+    [InlineData(1u, 4u)]
+    [InlineData(12u, 4u)]
+    [InlineData(uint.MaxValue, 4u)]
+    [InlineData(2u, 1u)]
+    [InlineData(2u, 12u)]
+    [InlineData(2u, uint.MaxValue)]
+    public void InvalidThumbInstructionOrTargetOffsetsAreRejected(uint offset, uint target)
+    {
+        Assert.Throws<InvalidDataException>(() => ThumbDispatch(new InputConfig { ComputedJumps = [ThumbJump(offset, target)] }));
+    }
+
+    [Fact]
+    public void AThumbDeclarationMustDescribeARegisterMoveToPC()
+    {
+        var context = ThumbDispatch(new InputConfig { ComputedJumps = [ThumbJump(0, 4)] });
+        Assert.Contains(FunctionAnalysis.Analyze(context, context.Functions[0]).Errors, error => error.Contains("not an ARM ADD"));
+
+        context = ThumbDispatch(new InputConfig { ComputedJumps = [ThumbJump(2, 4)] });
+        context.ROM.Write(Base + 2, 0x46FF, 2); // mov pc, pc is not a finite register dispatch
+        Assert.Contains(FunctionAnalysis.Analyze(context, context.Functions[0]).Errors, error => error.Contains("not an ARM ADD"));
+    }
+
+    [Fact]
+    public void CopiedThumbDispatchDoesNotRelocateAbsoluteRegisterTargets()
+    {
+        var context = ThumbDispatch(new InputConfig { ComputedJumps = [ThumbJump(2, 4, 8)], RAMFuncs = ["Dispatch"] });
+        var analysis = FunctionAnalysis.Analyze(context, context.Functions[0]);
+        string method = new CSharpGenerator(context).Generate(analysis);
+
+        Assert.Empty(analysis.Errors);
+        Assert.Contains("switch (target & ~1u)", method);
+        Assert.DoesNotContain("switch ((target & ~1u) - Recomp.CopyOffset)", method);
+        Assert.Contains("default: throw Recomp.SwitchError", method);
+    }
+
     [Fact]
     public void FiniteDispatchVisitsBothCasesWithoutDecodingPadding()
     {

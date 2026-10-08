@@ -237,9 +237,10 @@ internal sealed class Context
         foreach (var jump in input.ComputedJumps)
         {
             var function = byName[jump.Func].Single();
-            if ((ulong)jump.Offset + 4 > function.Size || (function.Address + jump.Offset) % 4 != 0
+            uint alignment = function.IsThumb ? 2u : 4u;
+            if ((ulong)jump.Offset + alignment > function.Size || (function.Address + jump.Offset) % alignment != 0
                 || jump.TargetOffsets.Count == 0
-                || jump.TargetOffsets.Any(offset => (ulong)offset + 4 > function.Size || (function.Address + offset) % 4 != 0))
+                || jump.TargetOffsets.Any(offset => (ulong)offset + alignment > function.Size || (function.Address + offset) % alignment != 0))
             {
                 throw new InvalidDataException($"input.computed_jumps for {jump.Func} needs an aligned instruction and nonempty aligned targets inside that function.");
             }

@@ -74,6 +74,7 @@ function_sizes = [
 ]
 
 # Finite targets for an ARM `add pc, pc, register, lsl #shift` dispatch.
+# Thumb `mov pc, register` dispatches use the same declaration.
 # Both the instruction offset and target offsets are relative to the named function.
 computed_jumps = [
     { func = "Dispatch", offset = 0x10, target_offsets = [0x18, 0x28] },
@@ -89,11 +90,13 @@ ignored = ["StrangeSwitch"]
 
 `computed_jumps` is for dispatches whose complete target set is known from the
 game's code and data. GBARecomp checks the function name, instruction form,
-alignment, and function bounds. It visits every declared target and emits the
-existing local switch dispatcher; an undeclared target throws at runtime.
-PC-relative targets in a `ram_funcs` function are normalized back to the original
-function's address before selecting a case, so copies in either RAM region use
-the same named function and hooks.
+alignment (four bytes for ARM, two for Thumb), and function bounds. It visits every
+declared target and emits the existing local switch dispatcher; an undeclared
+target throws at runtime.
+ARM PC-relative targets in a `ram_funcs` function are normalized back to the
+original function's address before selecting a case. Thumb MOV-to-PC dispatches
+use the register's absolute target without that adjustment. Copies in either RAM
+region retain the same named function and hooks.
 
 Thumb undefined-instruction traps (`0xDE00`–`0xDEFF`) and the emulator assertion
 stop (`0xEFFF`) end that execution path. They generate explicit native exceptions

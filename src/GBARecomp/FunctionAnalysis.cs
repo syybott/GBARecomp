@@ -282,9 +282,9 @@ internal sealed class FunctionAnalysis
             }
 
             bool configuredJump = _context.ComputedJumps.ContainsKey((Function.Name, instruction.Address));
-            if (configuredJump && !IsPCRelativeDispatch(instruction))
+            if (configuredJump && !IsPCRelativeDispatch(instruction) && !IsThumbRegisterDispatch(instruction))
             {
-                _errors.Add($"The configured computed jump at 0x{address:X8} is not an ARM ADD of a shifted register to PC.");
+                _errors.Add($"The configured computed jump at 0x{address:X8} is not an ARM ADD of a shifted register to PC or a Thumb MOV of a register to PC.");
                 return;
             }
 
@@ -321,7 +321,7 @@ internal sealed class FunctionAnalysis
     {
         if (_context.ComputedJumps.TryGetValue((Function.Name, instruction.Address), out var targets))
         {
-            return new Flow(FlowKind.JumpTable, Targets: targets, PCRelativeTargets: true);
+            return new Flow(FlowKind.JumpTable, Targets: targets, PCRelativeTargets: IsPCRelativeDispatch(instruction));
         }
         switch (instruction.Opcode)
         {
@@ -372,6 +372,10 @@ internal sealed class FunctionAnalysis
     private static bool IsPCRelativeDispatch(Instruction i) => i is
         { IsThumb: false, Opcode: Opcode.Add, Rd: PC, Rn: PC, OperandKind: OperandKind.ImmediateShift,
           ShiftType: ShiftType.LSL, SetsFlags: false } && i.Rm != PC;
+
+    private static bool IsThumbRegisterDispatch(Instruction i) => i is
+        { IsThumb: true, Opcode: Opcode.Mov, Rd: PC, OperandKind: OperandKind.ImmediateShift,
+          ShiftType: ShiftType.LSL, ShiftAmount: 0, SetsFlags: false } && i.Rm != PC;
 
     private static string? Unsupported(Instruction i, bool configuredJump)
     {
