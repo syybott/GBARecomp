@@ -26,6 +26,19 @@ It generates `Funcs`, which has a method for every function in the game, and `Da
 
 Thumb word jump tables can use agbcc's separate ADD-plus-load pattern or GCC's register-indexed load before `mov pc`. Analysis requires a recognized range check and local case targets. Tables may be inline in the function, including ROM-backed RAM code, or in a fully validated ROM range outside it. Unknown bounds and invalid tables remain generation errors.
 
+Range analysis accepts inclusive (`bhi`/`bls`) and exclusive (`bcs`/`bcc`)
+unsigned checks, unchanged register copies, and proven narrowing/offset patterns.
+When the guard truncates an index that the table uses at full width, every
+incoming path must establish a compatible typed range; an unknown high-bit value
+or a clobbered index still fails. Bounds are retried after other reachable paths
+have been decoded. Constant tracing and predecessor walks remain bounded.
+
+Local `bl` blocks can read LR as diagnostic data before calling another function.
+Return-address analysis follows the LR value through register copies and call
+clobbers, rather than treating every LR read as a return. Saving that value or
+returning through it still identifies a call. Generated local branches retain
+the architectural LR write and the original named function and patch surface.
+
 ## Config
 
 Paths in the config are relative to the config file itself. Here's an example you can start from:

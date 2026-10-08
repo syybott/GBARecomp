@@ -38,7 +38,7 @@ internal sealed class FunctionAnalysis
     private const uint SoftReset = 0x00;
     private const uint HardReset = 0x26;
     private const ushort PreservedAcrossCalls = 0x0FF0;
-    private const int JumpTablePathLimit = 32;
+    private const int JumpTablePathLimit = 64;
 
     private readonly Context _context;
     private readonly SortedDictionary<uint, Instruction> _instructions = [];
@@ -48,6 +48,8 @@ internal sealed class FunctionAnalysis
     private readonly List<string> _errors = [];
     private readonly List<(uint Target, bool IsThumb)> _unknownTargets = [];
     private readonly Stack<(uint Address, bool IsThumb)> _pending = [];
+    private readonly HashSet<Instruction> _unboundedJumpTables = [];
+    private readonly HashSet<uint> _returnAddressQueries = [];
 
     private FunctionAnalysis(Context context, Function function)
     {
@@ -76,9 +78,30 @@ internal sealed class FunctionAnalysis
         var analysis = new FunctionAnalysis(context, function);
         analysis._pending.Push((function.Address, function.IsThumb));
 
-        while (analysis._pending.TryPop(out var start))
+        bool resolved;
+        do
         {
-            analysis.FollowPath(start.Address, start.IsThumb);
+            while (analysis._pending.TryPop(out var start))
+            {
+                analysis.FollowPath(start.Address, start.IsThumb);
+            }
+
+            // A switch can be reached before another predecessor has been
+            // decoded. Retry its bound proof after those paths are available.
+            resolved = false;
+            foreach (var instruction in analysis._unboundedJumpTables.ToArray())
+            {
+                if (analysis.FindJumpTable(instruction) is not { Kind: FlowKind.JumpTable } flow) continue;
+                analysis._flows[instruction.Address] = flow;
+                foreach (uint target in flow.LocalTargets) analysis.AddLabel(target, instruction.IsThumb);
+                resolved = true;
+            }
+        }
+        while (resolved);
+
+        foreach (var instruction in analysis._unboundedJumpTables)
+        {
+            analysis._errors.Add($"The jump table dispatch at 0x{instruction.Address:X8} has no range check before it, so its size is unknown. Replace the function through patches.ignored.");
         }
 
         analysis.CheckLiterals();
@@ -154,26 +177,59 @@ internal sealed class FunctionAnalysis
 
     private bool UsesReturnAddress(uint start, bool isThumb)
     {
-        var visited = new HashSet<uint>();
-        var pending = new Stack<uint>([start]);
-        while (pending.TryPop(out uint address))
+        // Recursive local long branches must not make an unproven cycle look
+        // like a non-returning block.
+        if (!_returnAddressQueries.Add(start)) return true;
+        try { return FollowReturnAddress(start, isThumb); }
+        finally { _returnAddressQueries.Remove(start); }
+    }
+
+    private bool FollowReturnAddress(uint start, bool isThumb)
+    {
+        // LR can be passed as diagnostic data by a local long branch. Follow
+        // its value until it is returned through PC, saved, or clobbered.
+        var visited = new HashSet<(uint Address, ushort Registers)>();
+        var pending = new Stack<(uint Address, ushort Registers)>([(start, 1 << LR)]);
+        while (pending.TryPop(out var path))
         {
-            while (address + (isThumb ? 2 : 4) <= Function.End && visited.Add(address))
+            uint address = path.Address;
+            ushort registers = path.Registers;
+            while (registers != 0 && address + (isThumb ? 2 : 4) <= Function.End && visited.Add((address, registers)))
             {
                 var instruction = Decode(address, isThumb);
-                if (instruction.Reads(LR))
+                bool localLongBranch = IsFarJump(instruction);
+                bool readsReturnAddress = Enumerable.Range(0, PC).Any(register =>
+                    (registers & (1 << register)) != 0 && instruction.Reads((byte)register));
+                bool savesReturnAddress = instruction.Opcode == Opcode.Stm && (instruction.RegisterList & registers) != 0
+                    || (instruction.Opcode is Opcode.Str or Opcode.Strb or Opcode.Strh && (registers & (1 << instruction.Rd)) != 0);
+                if (savesReturnAddress || (readsReturnAddress && (instruction.Writes(PC) || instruction.Opcode == Opcode.Bx)))
                 {
                     return true;
                 }
 
-                if (instruction.Opcode == Opcode.B && Contains(instruction.Target))
+                ushort before = registers;
+                for (byte register = 0; register < PC; register++)
                 {
-                    pending.Push(instruction.Target);
+                    if (instruction.Writes(register)) registers &= (ushort)~(1 << register);
+                }
+                if (readsReturnAddress && instruction.Opcode <= Opcode.Mvn && !instruction.IsCompare)
+                {
+                    registers |= (ushort)(1 << instruction.Rd);
+                }
+                // BL definitely overwrites LR. Other registers may survive an
+                // assembly helper, even when the ABI permits it to clobber them.
+                if (instruction.Opcode == Opcode.Bl) registers = (ushort)(registers & ~(1 << LR));
+                if (instruction.Condition != Condition.AL) registers |= before;
+
+                if ((instruction.Opcode == Opcode.B && Contains(instruction.Target)) || localLongBranch)
+                {
+                    pending.Push((instruction.Target, registers));
                 }
 
                 bool endsPath = instruction.Opcode is Opcode.Undefined or Opcode.Trap
                     || (instruction.Condition == Condition.AL
-                        && (instruction.Writes(LR) || instruction.Writes(PC) || instruction.Opcode is Opcode.B or Opcode.Bx));
+                        && (instruction.Writes(PC) || instruction.Opcode is Opcode.B or Opcode.Bx || localLongBranch
+                            || (instruction.Opcode == Opcode.Bl && _context.FindFunction(instruction.Target) is { IsNoreturn: true })));
                 if (endsPath)
                 {
                     break;
@@ -462,9 +518,10 @@ internal sealed class FunctionAnalysis
         uint? entryCount = FindJumpTableEntryCount(table.ShiftIndex, movPC);
         if (entryCount is null or 0)
         {
-            _errors.Add($"The jump table dispatch at 0x{movPC.Address:X8} has no range check before it, so its size is unknown. Replace the function through patches.ignored.");
+            _unboundedJumpTables.Add(movPC);
             return null;
         }
+        _unboundedJumpTables.Remove(movPC);
 
         if (ReadLiteral(table.LoadTable) is not { } tableAddress || (tableAddress & 3) != 0)
         {
@@ -524,35 +581,139 @@ internal sealed class FunctionAnalysis
 
     private uint? FindJumpTableEntryCount(Instruction shiftIndex, Instruction movPC)
     {
-        byte index = shiftIndex.Rm;
         var path = PathBefore(movPC).ToList();
-        int shift = path.FindIndex(step => step.Instruction.Address == shiftIndex.Address);
         int rangeCheck = path.FindIndex(step => step.Instruction.Opcode == Opcode.B
-            && step.Instruction.Condition == (step.IsTaken ? Condition.LS : Condition.HI));
+            && (step.IsTaken ? step.Instruction.Condition is Condition.LS or Condition.CC
+                : step.Instruction.Condition is Condition.HI or Condition.CS));
 
-        if (shift < 0
-            || rangeCheck < 0
+        if (rangeCheck < 0
             || rangeCheck + 1 == path.Count
-            || path[rangeCheck + 1].Instruction is not { Opcode: Opcode.Cmp } compare
-            || compare.Rn != index)
+            || path[rangeCheck + 1].Instruction is not { Opcode: Opcode.Cmp } compare)
         {
             return null;
         }
 
-        int compared = rangeCheck + 1;
-        bool indexChanges = path
-            .Skip(Math.Min(shift, compared) + 1)
-            .Take(Math.Abs(shift - compared) - 1)
-            .Any(step => MayChange(step.Instruction, index));
-        if (indexChanges || (shift > compared && shiftIndex.Rd == index))
+        var index = FindIndexValue(shiftIndex.Rm, shiftIndex);
+        var compared = FindIndexValue(compare.Rn, compare);
+        if (index.Register != compared.Register || !SameIndexValue(index, compared))
         {
             return null;
         }
 
-        uint? last = compare.OperandKind == OperandKind.Immediate
+        uint? bound = compare.OperandKind == OperandKind.Immediate
             ? compare.Immediate
             : FindConstant(compare.Rm, compare.Address);
-        return last + 1;
+        bool exclusive = path[rangeCheck].Instruction.Condition is Condition.CC or Condition.CS;
+        if (bound is null || (exclusive && bound == 0)) return null;
+
+        ulong last = exclusive ? bound.Value - 1 : bound.Value;
+        ulong modulus = 1ul << compared.Bits;
+        ulong upper = Math.Min(((last + 1) << compared.RightShift) - 1, modulus - 1);
+        if (index.Bits == compared.Bits && index.Adjustment == compared.Adjustment)
+        {
+            ulong count = (upper >> index.RightShift) + 1;
+            return count <= uint.MaxValue ? (uint)count : null;
+        }
+        var range = IndexRange(compared.Register, compared.ReadAt);
+        // A narrowing conversion must not let a different high-bit value pass
+        // the check while indexing the original, untruncated register.
+        if (upper >= modulus || range.Max + compared.Adjustment >= (long)modulus
+            || range.Min + compared.Adjustment + (long)modulus <= (long)upper)
+        {
+            return null;
+        }
+
+        long minimumIndex = index.Adjustment - compared.Adjustment;
+        long maximumIndex = (long)upper + minimumIndex;
+        if (minimumIndex < 0 || maximumIndex >= (1L << index.Bits)) return null;
+        ulong entries = ((ulong)maximumIndex >> index.RightShift) + 1;
+        return entries <= uint.MaxValue ? (uint)entries : null;
+    }
+
+    private readonly record struct IndexValue(byte Register, Instruction ReadAt, long Adjustment = 0, int Bits = 32, int RightShift = 0);
+
+    private IndexValue FindIndexValue(byte register, Instruction before)
+    {
+        var value = new IndexValue(register, before);
+        if (FindWriter(register, before) is not { } writer) return value;
+        if (writer is { Opcode: Opcode.Mov, OperandKind: OperandKind.ImmediateShift, ShiftType: ShiftType.LSL, ShiftAmount: 0 })
+            return FindIndexValue(writer.Rm, writer);
+        if (writer is { Opcode: Opcode.Add or Opcode.Sub, OperandKind: OperandKind.Immediate })
+        {
+            var source = FindIndexValue(writer.Rn, writer);
+            if (source.Bits == 32 && source.RightShift == 0)
+                return source with { Adjustment = source.Adjustment + (writer.Opcode == Opcode.Add ? writer.Immediate : -(long)writer.Immediate) };
+        }
+        if (writer is { Opcode: Opcode.Mov, OperandKind: OperandKind.ImmediateShift, ShiftType: ShiftType.LSR })
+        {
+            if (FindWriter(writer.Rm, writer) is { Opcode: Opcode.Mov, OperandKind: OperandKind.ImmediateShift,
+                    ShiftType: ShiftType.LSL, ShiftAmount: > 0 } left && left.ShiftAmount <= writer.ShiftAmount)
+            {
+                var source = FindIndexValue(left.Rm, left);
+                if (source.RightShift == 0)
+                    return source with { Bits = Math.Min(source.Bits, 32 - left.ShiftAmount), RightShift = writer.ShiftAmount - left.ShiftAmount };
+            }
+            else
+            {
+                var source = FindIndexValue(writer.Rm, writer);
+                if (source.RightShift + writer.ShiftAmount < 32)
+                    return source with { RightShift = source.RightShift + writer.ShiftAmount };
+            }
+        }
+        return value;
+    }
+
+    private bool SameIndexValue(IndexValue first, IndexValue second)
+    {
+        if (first.ReadAt.Address == second.ReadAt.Address) return true;
+        var earlier = first.ReadAt.Address < second.ReadAt.Address ? first : second;
+        var later = first.ReadAt.Address > second.ReadAt.Address ? first : second;
+        var between = PathBefore(later.ReadAt).ToList();
+        int read = between.FindIndex(step => step.Instruction.Address == earlier.ReadAt.Address);
+        return read >= 0 && !between.Take(read + 1).Any(step => MayChange(step.Instruction, first.Register));
+    }
+
+    private (long Min, long Max) IndexRange(byte register, Instruction before)
+    {
+        // Each incoming path must establish a bounded value. A typed load on
+        // only one predecessor cannot justify truncating an unknown value.
+        (long Min, long Max) unknown = (int.MinValue, int.MaxValue);
+        long minimum = long.MaxValue, maximum = long.MinValue;
+        var pending = new Stack<uint>([before.Address]);
+        var visited = new HashSet<uint>();
+        while (pending.TryPop(out uint address))
+        {
+            if (!visited.Add(address)) continue;
+            if (address == Function.Address || visited.Count > JumpTablePathLimit) return unknown;
+            var predecessors = _flows.Where(pair => pair.Value.LocalTargets.Contains(address))
+                .Select(pair => _instructions[pair.Key]).ToList();
+            if (TryGetInstructionBefore(address, out var previous)
+                && (!_flows.TryGetValue(previous.Address, out var flow) || flow.FallsThrough(previous)))
+                predecessors.Add(previous);
+            if (predecessors.Count == 0) return unknown;
+            foreach (var predecessor in predecessors)
+            {
+                if (predecessor.Writes(register))
+                {
+                    var range = predecessor switch
+                    {
+                        { Opcode: Opcode.Ldrb } => (0L, byte.MaxValue),
+                        { Opcode: Opcode.Ldrh } => (0L, ushort.MaxValue),
+                        { Opcode: Opcode.Ldrsb } => ((long)sbyte.MinValue, sbyte.MaxValue),
+                        { Opcode: Opcode.Ldrsh } => ((long)short.MinValue, short.MaxValue),
+                        { Opcode: Opcode.Mov, OperandKind: OperandKind.Immediate } literal => ((long)(int)literal.Immediate, (int)literal.Immediate),
+                        _ => unknown,
+                    };
+                    if (range == unknown) return unknown;
+                    minimum = Math.Min(minimum, range.Item1);
+                    maximum = Math.Max(maximum, range.Item2);
+                    continue;
+                }
+                if (MayChange(predecessor, register)) return unknown;
+                pending.Push(predecessor.Address);
+            }
+        }
+        return minimum <= maximum ? (minimum, maximum) : unknown;
     }
 
     private Instruction? FindWriter(byte register, Instruction before)
@@ -583,16 +744,23 @@ internal sealed class FunctionAnalysis
     private IEnumerable<(Instruction Instruction, bool IsTaken)> PathBefore(Instruction start)
     {
         uint address = start.Address;
-        for (int step = 0; step < JumpTablePathLimit && TryGetInstructionBefore(address, out var previous); step++)
+        for (int step = 0; step < JumpTablePathLimit; step++)
         {
-            bool isTaken = _flows.TryGetValue(previous.Address, out var flow) && !flow.FallsThrough(previous);
-            if (isTaken
+            bool hasPrevious = TryGetInstructionBefore(address, out var previous);
+            bool hasFlow = _flows.TryGetValue(previous.Address, out var flow);
+            bool isTaken = hasPrevious && hasFlow && !flow.FallsThrough(previous);
+            if (!hasPrevious || (isTaken
                 && (flow.Kind != FlowKind.Branch
                     || !TryGetInstructionBefore(previous.Address, out previous)
                     || previous is not { Opcode: Opcode.B, Condition: not Condition.AL }
-                    || previous.Target != address))
+                    || previous.Target != address)))
             {
-                yield break;
+                // GCC can put another block immediately before a branch target.
+                // Follow its incoming edge only when that predecessor is unique.
+                var incoming = _instructions.Values.Where(i => i.Opcode == Opcode.B && i.Target == address).Take(2).ToArray();
+                if (incoming.Length != 1) yield break;
+                previous = incoming[0];
+                isTaken = true;
             }
 
             yield return (previous, isTaken);
@@ -608,35 +776,15 @@ internal sealed class FunctionAnalysis
 
     private uint? FindConstant(byte register, uint address)
     {
-        for (int step = 0; step < 4; step++)
+        if (!_instructions.TryGetValue(address, out var before) || FindWriter(register, before) is not { } writer) return null;
+        return writer switch
         {
-            if (!TryGetInstructionBefore(address, out var instruction))
-            {
-                return null;
-            }
-
-            address = instruction.Address;
-            if (instruction.Opcode is Opcode.B or Opcode.Bl or Opcode.Bx or Opcode.Swi)
-            {
-                return null;
-            }
-
-            if (!instruction.Writes(register))
-            {
-                continue;
-            }
-
-            return instruction switch
-            {
-                { Opcode: Opcode.Ldr, Rn: PC } => ReadLiteral(instruction),
-                { Opcode: Opcode.Mov, OperandKind: OperandKind.Immediate } => instruction.Immediate,
-                { Opcode: Opcode.Mov, OperandKind: OperandKind.ImmediateShift, ShiftType: ShiftType.LSL }
-                    when instruction.Rm == register => FindConstant(register, address) << instruction.ShiftAmount,
-                _ => null,
-            };
-        }
-
-        return null;
+            { Opcode: Opcode.Ldr, Rn: PC } => ReadLiteral(writer),
+            { Opcode: Opcode.Mov, OperandKind: OperandKind.Immediate } => writer.Immediate,
+            { Opcode: Opcode.Mov, OperandKind: OperandKind.ImmediateShift, ShiftType: ShiftType.LSL }
+                => FindConstant(writer.Rm, writer.Address) << writer.ShiftAmount,
+            _ => null,
+        };
     }
 
     private uint? ReadLiteral(Instruction load)
