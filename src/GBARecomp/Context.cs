@@ -61,6 +61,8 @@ internal sealed class Context
         ComputedJumps = input.ComputedJumps.ToDictionary(
             jump => (jump.Func, FindByName(jump.Func).Address + jump.Offset),
             jump => jump.TargetOffsets.Select(offset => FindByName(jump.Func).Address + offset).Distinct().ToArray());
+        LandingPads = input.LandingPads.ToDictionary(
+            pad => pad.Func, pad => pad.Offsets.Select(offset => FindByName(pad.Func).Address + offset).ToArray());
 
         Function FindByName(string name) => functions.Single(f => f.Name == name);
     }
@@ -82,6 +84,8 @@ internal sealed class Context
     public ILookup<string, FunctionHook> Hooks { get; }
 
     public IReadOnlyDictionary<(string Function, uint Address), uint[]> ComputedJumps { get; }
+
+    public IReadOnlyDictionary<string, uint[]> LandingPads { get; }
 
     public Function? FindFunction(uint address) => _functionsByAddress.GetValueOrDefault(address);
 
@@ -162,6 +166,7 @@ internal sealed class Context
             .Concat(patches.Stubs).Concat(patches.Ignored)
             .Concat(patches.Instruction.Select(p => p.Func)).Concat(patches.Hook.Select(h => h.Func))
             .Concat(input.ComputedJumps.Select(jump => jump.Func))
+            .Concat(input.LandingPads.Select(pad => pad.Func))
             .Distinct()
             .ToList();
 
@@ -243,6 +248,27 @@ internal sealed class Context
                 || jump.TargetOffsets.Any(offset => (ulong)offset + alignment > function.Size || (function.Address + offset) % alignment != 0))
             {
                 throw new InvalidDataException($"input.computed_jumps for {jump.Func} needs an aligned instruction and nonempty aligned targets inside that function.");
+            }
+        }
+
+        var duplicatePads = input.LandingPads.GroupBy(pad => pad.Func).FirstOrDefault(group => group.Count() > 1);
+        if (duplicatePads is not null)
+        {
+            throw new InvalidDataException($"input.landing_pads repeats {duplicatePads.Key}.");
+        }
+        foreach (var pad in input.LandingPads)
+        {
+            var function = byName[pad.Func].Single();
+            uint alignment = function.IsThumb ? 2u : 4u;
+            if (pad.Offsets.Count == 0 || pad.Offsets.Distinct().Count() != pad.Offsets.Count
+                || pad.Offsets.Any(offset => offset == 0 || (ulong)offset + alignment > function.Size
+                    || (function.Address + offset) % alignment != 0))
+            {
+                throw new InvalidDataException($"input.landing_pads for {pad.Func} needs nonempty unique aligned offsets inside that function, after its entry.");
+            }
+            if (patches.Stubs.Contains(pad.Func) || patches.Ignored.Contains(pad.Func))
+            {
+                throw new InvalidDataException($"input.landing_pads for {pad.Func} requires a recompiled function, not a stub or ignored function.");
             }
         }
 

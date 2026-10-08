@@ -74,4 +74,18 @@ public class ConfigTests : IDisposable
         Assert.Equal(0x10u, jump.Offset);
         Assert.Equal([0x18u, 0x28u], jump.TargetOffsets);
     }
+
+    [Fact]
+    public void LandingPadsKeepTheirFunctionRelativeOffsets()
+    {
+        var config = Config.Load(Write(Minimal + """
+            [[input.landing_pads]]
+            func = "ScriptLoop"
+            offsets = [0x80, 0x90]
+            """));
+
+        var pad = Assert.Single(config.Input.LandingPads);
+        Assert.Equal("ScriptLoop", pad.Func);
+        Assert.Equal([0x80u, 0x90u], pad.Offsets);
+    }
 }

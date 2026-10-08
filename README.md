@@ -80,6 +80,12 @@ computed_jumps = [
     { func = "Dispatch", offset = 0x10, target_offsets = [0x18, 0x28] },
 ]
 
+# Local continuations for nonlocal jumps that ordinary control flow does not reach.
+# Offsets are relative to the named function, in that function's instruction mode.
+landing_pads = [
+    { func = "ScriptLoop", offsets = [0x80] },
+]
+
 [patches]
 # These become empty functions
 stubs = ["DebugPrint"]
@@ -97,6 +103,15 @@ ARM PC-relative targets in a `ram_funcs` function are normalized back to the
 original function's address before selecting a case. Thumb MOV-to-PC dispatches
 use the register's absolute target without that adjustment. Copies in either RAM
 region retain the same named function and hooks.
+
+`landing_pads` declares saved continuations such as a compiler-built
+`setjmp`/`longjmp` target. GBARecomp decodes each declared path and uses its
+existing unwind/resume checks in the owning function. It does not register a
+new function or replace the original named hook. Declarations require a unique
+function name, a nonempty list of unique aligned offsets after the function
+entry, and targets within the function. Stub/ignored functions, instruction
+overlaps, and code overlapping loaded literal data are rejected. Copied functions
+use the existing `CopyOffset` adjustment when matching a resume address.
 
 Thumb undefined-instruction traps (`0xDE00`–`0xDEFF`) and the emulator assertion
 stop (`0xEFFF`) end that execution path. They generate explicit native exceptions

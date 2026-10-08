@@ -76,6 +76,12 @@ internal sealed class FunctionAnalysis
     public static FunctionAnalysis Analyze(Context context, Function function)
     {
         var analysis = new FunctionAnalysis(context, function);
+        foreach (uint address in context.LandingPads.GetValueOrDefault(function.Name) ?? [])
+        {
+            analysis._landingPads.Add(address);
+            analysis.AddLabel(address, function.IsThumb);
+        }
+        // Visit ordinary control flow first, then the explicit continuations.
         analysis._pending.Push((function.Address, function.IsThumb));
 
         bool resolved;
@@ -105,6 +111,7 @@ internal sealed class FunctionAnalysis
         }
 
         analysis.CheckLiterals();
+        analysis.CheckConfiguredLandingPads();
         analysis.CheckHooks();
         foreach (var key in context.ComputedJumps.Keys.Where(key => key.Function == function.Name))
         {
@@ -129,6 +136,18 @@ internal sealed class FunctionAnalysis
             {
                 _landingPads.Add(address);
                 _labels.Add(address);
+            }
+        }
+    }
+
+    private void CheckConfiguredLandingPads()
+    {
+        foreach (uint address in _context.LandingPads.GetValueOrDefault(Function.Name) ?? [])
+        {
+            if (!_instructions.ContainsKey(address)
+                || _instructions.Values.Any(instruction => instruction.Address < address && instruction.Address + instruction.Size > address))
+            {
+                _errors.Add($"The configured landing pad at 0x{address:X8} is not at a decoded instruction boundary in {Function.Name}.");
             }
         }
     }

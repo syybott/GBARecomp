@@ -183,6 +183,17 @@ public sealed class InputConfig
 
     /// <summary><c>computed_jumps</c>: finite local targets for ARM PC-relative or Thumb MOV-to-PC dispatches that cannot be inferred automatically.</summary>
     public List<ComputedJump> ComputedJumps { get; set; } = [];
+
+    /// <summary><c>landing_pads</c>: explicit local continuations for nonlocal jumps, such as compiler-built setjmp/longjmp.</summary>
+    public List<LandingPad> LandingPads { get; set; } = [];
+}
+
+/// <summary>One entry of <c>input.landing_pads</c>. Offsets are relative to the named function.</summary>
+public sealed class LandingPad
+{
+    public string Func { get; set; } = "";
+
+    public List<uint> Offsets { get; set; } = [];
 }
 
 /// <summary>One entry of <c>input.computed_jumps</c>. Offsets are relative to the named function.</summary>
