@@ -24,6 +24,8 @@ dotnet run --project src/GBARecomp -c Release -- game.toml
 
 It generates `Funcs`, which has a method for every function in the game, and `Data`, which has the address of every other symbol. Only the files that actually changed get rewritten, so your build doesn't have to start over every time. If something can't be recompiled, GBARecomp lists every problem it found and writes nothing.
 
+Thumb word jump tables can use agbcc's separate ADD-plus-load pattern or GCC's register-indexed load before `mov pc`. Analysis requires a recognized range check and local case targets. Tables may be inline in the function, including ROM-backed RAM code, or in a fully validated ROM range outside it. Unknown bounds and invalid tables remain generation errors.
+
 ## Config
 
 Paths in the config are relative to the config file itself. Here's an example you can start from:

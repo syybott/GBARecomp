@@ -439,30 +439,53 @@ internal sealed class FunctionAnalysis
     private Flow? FindJumpTable(Instruction movPC)
     {
         if (!movPC.IsThumb
-            || FindWriter(movPC.Rm, movPC) is not { Opcode: Opcode.Ldr, OperandKind: OperandKind.Immediate, Immediate: 0 } loadEntry
-            || FindWriter(loadEntry.Rn, loadEntry) is not { Opcode: Opcode.Add, OperandKind: OperandKind.ImmediateShift, ShiftType: ShiftType.LSL, ShiftAmount: 0 } addTable
-            || FindTableAndIndex(addTable) is not { } table)
+            || FindWriter(movPC.Rm, movPC) is not { Opcode: Opcode.Ldr } loadEntry)
+        {
+            return null;
+        }
+
+        // agbcc adds the table and scaled index before loading; GCC can use
+        // the same operands directly in a register-indexed word load.
+        Instruction? addressCalculation = loadEntry switch
+        {
+            { OperandKind: OperandKind.ImmediateShift, ShiftType: ShiftType.LSL, ShiftAmount: 0 } => loadEntry,
+            { OperandKind: OperandKind.Immediate, Immediate: 0 }
+                when FindWriter(loadEntry.Rn, loadEntry) is
+                    { Opcode: Opcode.Add, OperandKind: OperandKind.ImmediateShift, ShiftType: ShiftType.LSL, ShiftAmount: 0 } addTable => addTable,
+            _ => null,
+        };
+        if (addressCalculation is not { } calculation || FindTableAndIndex(calculation) is not { } table)
         {
             return null;
         }
 
         uint? entryCount = FindJumpTableEntryCount(table.ShiftIndex, movPC);
-        if (entryCount is null)
+        if (entryCount is null or 0)
         {
             _errors.Add($"The jump table dispatch at 0x{movPC.Address:X8} has no range check before it, so its size is unknown. Replace the function through patches.ignored.");
             return null;
         }
 
-        if (ReadLiteral(table.LoadTable) is not { } tableAddress || tableAddress < Function.Address || tableAddress + entryCount * 4 > Function.End)
+        if (ReadLiteral(table.LoadTable) is not { } tableAddress || (tableAddress & 3) != 0)
         {
-            _errors.Add($"The jump table for 0x{movPC.Address:X8} is outside the function. Fix the size with input.function_sizes.");
+            _errors.Add($"The jump table for 0x{movPC.Address:X8} has no readable, word-aligned address.");
+            return null;
+        }
+
+        ulong tableSize = (ulong)entryCount.Value * 4;
+        bool tableInFunction = tableAddress >= Function.Address && (ulong)tableAddress + tableSize <= Function.End;
+        if (!tableInFunction && (tableSize > uint.MaxValue || !_context.ROM.Contains(tableAddress, (uint)tableSize)))
+        {
+            _errors.Add($"The jump table for 0x{movPC.Address:X8} is outside the function and its full range is not in ROM.");
             return null;
         }
 
         var targets = new uint[entryCount.Value];
         for (uint i = 0; i < targets.Length; i++)
         {
-            uint target = _context.ReadUInt32(Function, tableAddress + i * 4) & ~1u;
+            // Inline tables can be linked in RAM; external tables use ROM addresses.
+            uint entryAddress = tableAddress + i * 4;
+            uint target = (tableInFunction ? _context.ReadUInt32(Function, entryAddress) : _context.ROM.ReadUInt32(entryAddress)) & ~1u;
             if (!Contains(target))
             {
                 _errors.Add($"Jump table entry 0x{target:X8} at 0x{tableAddress + i * 4:X8} is outside the function. Fix the size with input.function_sizes.");
@@ -475,11 +498,11 @@ internal sealed class FunctionAnalysis
         return new Flow(FlowKind.JumpTable, Targets: targets.Distinct().ToArray());
     }
 
-    private (Instruction LoadTable, Instruction ShiftIndex)? FindTableAndIndex(Instruction addTable)
+    private (Instruction LoadTable, Instruction ShiftIndex)? FindTableAndIndex(Instruction calculation)
     {
-        foreach (var (table, index) in new[] { (addTable.Rn, addTable.Rm), (addTable.Rm, addTable.Rn) })
+        foreach (var (table, index) in new[] { (calculation.Rn, calculation.Rm), (calculation.Rm, calculation.Rn) })
         {
-            if (FindWriter(table, addTable) is { Opcode: Opcode.Ldr, Rn: PC } loadTable && FindScaledIndex(index, addTable) is { } shiftIndex)
+            if (FindWriter(table, calculation) is { Opcode: Opcode.Ldr, Rn: PC } loadTable && FindScaledIndex(index, calculation) is { } shiftIndex)
             {
                 return (loadTable, shiftIndex);
             }
