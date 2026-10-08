@@ -359,7 +359,6 @@ public class ThumbDecoderTests
     }
 
     [Theory]
-    [InlineData(0xDE00, 0)]
     [InlineData(0xE800, 0)]
     [InlineData(0x4780, 0)] // blx r0
     [InlineData(0xBE00, 0)] // bkpt #0

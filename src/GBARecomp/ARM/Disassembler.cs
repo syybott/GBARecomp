@@ -78,6 +78,9 @@ internal static class Disassembler
             case Opcode.Swi:
                 return $"swi{condition} 0x{i.Immediate:x}";
 
+            case Opcode.Trap:
+                return $"trap 0x{i.Encoding:x4}";
+
             default:
                 return i.IsThumb && i.Size == 2 ? $".hword 0x{i.Encoding:x4}" : $".word 0x{i.Encoding:x8}";
         }

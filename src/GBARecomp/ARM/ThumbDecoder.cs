@@ -15,6 +15,13 @@ internal static class ThumbDecoder
             Condition = Condition.AL,
         };
 
+        // GCC's deliberate undefined-instruction trap and the emulator assertion stop.
+        // Preserve failure at execution time instead of rejecting unrelated game code.
+        if ((encoding & 0xFF00) == 0xDE00 || encoding == 0xEFFF)
+        {
+            return instruction with { Opcode = Opcode.Trap };
+        }
+
         return (encoding >> 11) switch
         {
             0b00000 or 0b00001 or 0b00010 => DecodeShift(instruction, encoding),

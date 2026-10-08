@@ -16,6 +16,7 @@ internal enum Opcode : byte
     Swp, Swpb,
     Mrs, Msr,
     Swi,
+    Trap,
     Undefined,
 }
 

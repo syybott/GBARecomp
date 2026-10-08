@@ -58,4 +58,20 @@ public class ConfigTests : IDisposable
 
         Assert.Throws<InvalidDataException>(() => Config.Load(Write(toml)));
     }
+
+    [Fact]
+    public void ComputedJumpsKeepTheirFunctionRelativeOffsets()
+    {
+        var config = Config.Load(Write(Minimal + """
+            [[input.computed_jumps]]
+            func = "Dispatch"
+            offset = 0x10
+            target_offsets = [0x18, 0x28]
+            """));
+
+        var jump = Assert.Single(config.Input.ComputedJumps);
+        Assert.Equal("Dispatch", jump.Func);
+        Assert.Equal(0x10u, jump.Offset);
+        Assert.Equal([0x18u, 0x28u], jump.TargetOffsets);
+    }
 }

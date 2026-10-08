@@ -300,8 +300,8 @@ public class FunctionAnalysisTests
         ushort[] code =
         [
             0xF000, 0xF802, // 00: bl 0x08
-            0xDE00,         // 04: undefined
-            0xDE00,         // 06: undefined
+            0xFFFF,         // 04: undefined
+            0xFFFF,         // 06: undefined
             0xE7FE,         // 08: b .
         ];
         Symbol[] symbols = [new Symbol(Base, 8, "Caller"), new Symbol(Base + 8, 2, "Abort")];

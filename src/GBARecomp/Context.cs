@@ -58,6 +58,11 @@ internal sealed class Context
         Stubs = patches.Stubs.ToHashSet();
         Ignored = patches.Ignored.ToHashSet();
         Hooks = patches.Hook.ToLookup(hook => hook.Func);
+        ComputedJumps = input.ComputedJumps.ToDictionary(
+            jump => (jump.Func, FindByName(jump.Func).Address + jump.Offset),
+            jump => jump.TargetOffsets.Select(offset => FindByName(jump.Func).Address + offset).Distinct().ToArray());
+
+        Function FindByName(string name) => functions.Single(f => f.Name == name);
     }
 
     public ROM ROM { get; }
@@ -75,6 +80,8 @@ internal sealed class Context
     public IReadOnlySet<string> Ignored { get; }
 
     public ILookup<string, FunctionHook> Hooks { get; }
+
+    public IReadOnlyDictionary<(string Function, uint Address), uint[]> ComputedJumps { get; }
 
     public Function? FindFunction(uint address) => _functionsByAddress.GetValueOrDefault(address);
 
@@ -154,6 +161,7 @@ internal sealed class Context
         var configNames = armFuncs.Concat(noreturnFuncs).Concat(ramFuncs).Concat(sizes.Keys)
             .Concat(patches.Stubs).Concat(patches.Ignored)
             .Concat(patches.Instruction.Select(p => p.Func)).Concat(patches.Hook.Select(h => h.Func))
+            .Concat(input.ComputedJumps.Select(jump => jump.Func))
             .Distinct()
             .ToList();
 
@@ -218,6 +226,22 @@ internal sealed class Context
             if (hook.BeforeAddress != 0 && (hook.BeforeAddress < function.Address || hook.BeforeAddress >= function.End))
             {
                 throw new InvalidDataException($"The hook at 0x{hook.BeforeAddress:X8} is outside {function.Name}.");
+            }
+        }
+
+        var duplicateJumps = input.ComputedJumps.GroupBy(jump => (jump.Func, jump.Offset)).FirstOrDefault(g => g.Count() > 1);
+        if (duplicateJumps is not null)
+        {
+            throw new InvalidDataException($"input.computed_jumps repeats {duplicateJumps.Key.Func}+0x{duplicateJumps.Key.Offset:X}.");
+        }
+        foreach (var jump in input.ComputedJumps)
+        {
+            var function = byName[jump.Func].Single();
+            if ((ulong)jump.Offset + 4 > function.Size || (function.Address + jump.Offset) % 4 != 0
+                || jump.TargetOffsets.Count == 0
+                || jump.TargetOffsets.Any(offset => (ulong)offset + 4 > function.Size || (function.Address + offset) % 4 != 0))
+            {
+                throw new InvalidDataException($"input.computed_jumps for {jump.Func} needs an aligned instruction and nonempty aligned targets inside that function.");
             }
         }
 

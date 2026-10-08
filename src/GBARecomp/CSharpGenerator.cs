@@ -433,6 +433,10 @@ internal sealed class CSharpGenerator
                     Emit($"Recomp.SWI(ctx, 0x{i.BIOSFunction:X2});");
                     EmitJumpCycles(Function.Region, i.IsThumb);
                     break;
+                case Opcode.Trap:
+                    string reason = i.Encoding == 0xEFFF ? "Emulator assertion stop" : "Undefined-instruction trap";
+                    Emit($"throw new System.InvalidOperationException(\"{reason} in {Function.Name} at 0x{i.Address:X8} (0x{i.Encoding:X4}).\");");
+                    break;
                 default:
                     throw new UnreachableException();
             }
@@ -677,7 +681,9 @@ internal sealed class CSharpGenerator
 
                 case FlowKind.JumpTable:
                     EmitJumpCycles(Function.Region, i.IsThumb);
-                    Emit("switch (target & ~1u)");
+                    string dispatch = flow.PCRelativeTargets && Function.IsCopiedToRAM
+                        ? "(target & ~1u) - Recomp.CopyOffset" : "target & ~1u";
+                    Emit($"switch ({dispatch})");
                     Emit("{");
                     _indent++;
                     foreach (uint target in flow.Targets!)

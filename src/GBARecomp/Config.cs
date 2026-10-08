@@ -180,6 +180,19 @@ public sealed class InputConfig
 
     /// <summary><c>function_sizes</c>: sizes to use instead of the ones in the symbols, for when those are wrong.</summary>
     public List<FunctionSize> FunctionSizes { get; set; } = [];
+
+    /// <summary><c>computed_jumps</c>: finite local targets for ARM PC-relative dispatches that cannot be inferred automatically.</summary>
+    public List<ComputedJump> ComputedJumps { get; set; } = [];
+}
+
+/// <summary>One entry of <c>input.computed_jumps</c>. Offsets are relative to the named function.</summary>
+public sealed class ComputedJump
+{
+    public string Func { get; set; } = "";
+
+    public uint Offset { get; set; }
+
+    public List<uint> TargetOffsets { get; set; } = [];
 }
 
 /// <summary>One entry of <c>manual_funcs</c>.</summary>

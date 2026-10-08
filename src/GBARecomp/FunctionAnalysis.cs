@@ -14,9 +14,10 @@ internal enum FlowKind
     BranchExchange,
     IndirectCall,
     IndirectJump,
+    Trap,
 }
 
-internal readonly record struct Flow(FlowKind Kind, uint Target = 0, uint[]? Targets = null)
+internal readonly record struct Flow(FlowKind Kind, uint Target = 0, uint[]? Targets = null, bool PCRelativeTargets = false)
 {
     public IEnumerable<uint> LocalTargets => Kind switch
     {
@@ -82,6 +83,13 @@ internal sealed class FunctionAnalysis
 
         analysis.CheckLiterals();
         analysis.CheckHooks();
+        foreach (var key in context.ComputedJumps.Keys.Where(key => key.Function == function.Name))
+        {
+            if (!analysis._instructions.ContainsKey(key.Address))
+            {
+                analysis._errors.Add($"The configured computed jump at 0x{key.Address:X8} is not at an instruction that runs.");
+            }
+        }
         analysis.FindLandingPads();
         return analysis;
     }
@@ -163,7 +171,7 @@ internal sealed class FunctionAnalysis
                     pending.Push(instruction.Target);
                 }
 
-                bool endsPath = instruction.Opcode == Opcode.Undefined
+                bool endsPath = instruction.Opcode is Opcode.Undefined or Opcode.Trap
                     || (instruction.Condition == Condition.AL
                         && (instruction.Writes(LR) || instruction.Writes(PC) || instruction.Opcode is Opcode.B or Opcode.Bx));
                 if (endsPath)
@@ -217,7 +225,14 @@ internal sealed class FunctionAnalysis
                 return;
             }
 
-            if (Unsupported(instruction) is { } problem)
+            bool configuredJump = _context.ComputedJumps.ContainsKey((Function.Name, instruction.Address));
+            if (configuredJump && !IsPCRelativeDispatch(instruction))
+            {
+                _errors.Add($"The configured computed jump at 0x{address:X8} is not an ARM ADD of a shifted register to PC.");
+                return;
+            }
+
+            if (Unsupported(instruction, configuredJump) is { } problem)
             {
                 _errors.Add($"0x{address:X8} ({Disassembler.Format(instruction)}) {problem}");
                 return;
@@ -248,8 +263,14 @@ internal sealed class FunctionAnalysis
 
     private Flow Classify(Instruction instruction)
     {
+        if (_context.ComputedJumps.TryGetValue((Function.Name, instruction.Address), out var targets))
+        {
+            return new Flow(FlowKind.JumpTable, Targets: targets, PCRelativeTargets: true);
+        }
         switch (instruction.Opcode)
         {
+            case Opcode.Trap:
+                return new Flow(FlowKind.Trap);
             case Opcode.B when Contains(instruction.Target):
                 return new Flow(FlowKind.Branch, instruction.Target);
 
@@ -292,7 +313,11 @@ internal sealed class FunctionAnalysis
         }
     }
 
-    private static string? Unsupported(Instruction i)
+    private static bool IsPCRelativeDispatch(Instruction i) => i is
+        { IsThumb: false, Opcode: Opcode.Add, Rd: PC, Rn: PC, OperandKind: OperandKind.ImmediateShift,
+          ShiftType: ShiftType.LSL, SetsFlags: false } && i.Rm != PC;
+
+    private static string? Unsupported(Instruction i, bool configuredJump)
     {
         bool usesPC = i.Opcode switch
         {
@@ -329,7 +354,7 @@ internal sealed class FunctionAnalysis
 
         bool computesJumpFromPC = i.Rd == PC && i.Rn == PC && i.OperandKind != OperandKind.Immediate
             && (i.Opcode is Opcode.Ldr || (i.Opcode <= Opcode.Mvn && !i.IsCompare));
-        if (computesJumpFromPC)
+        if (computesJumpFromPC && !configuredJump)
         {
             return "jumps to an address worked out from R15. Only agbcc's Thumb jump tables are recognized, so replace the function through patches.ignored.";
         }

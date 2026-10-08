@@ -20,7 +20,7 @@ public class DisassemblerTests
     [Theory]
     [InlineData((ushort)0xB510, "stmdb sp!, {r4, lr}")]
     [InlineData((ushort)0x4802, "ldr r0, [pc, #0x8]")]
-    [InlineData((ushort)0xDE00, ".hword 0xde00")]
+    [InlineData((ushort)0xDE00, "trap 0xde00")]
     public void ThumbInstructions(ushort encoding, string text)
     {
         Assert.Equal(text, Disassembler.Format(ThumbDecoder.Decode(TestCode.Base, encoding, 0)));
