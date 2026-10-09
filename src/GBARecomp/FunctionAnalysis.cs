@@ -39,6 +39,7 @@ internal sealed class FunctionAnalysis
     private const uint HardReset = 0x26;
     private const ushort PreservedAcrossCalls = 0x0FF0;
     private const int JumpTablePathLimit = 64;
+    private const int TableBaseStateLimit = 4096;
 
     private readonly Context _context;
     private readonly SortedDictionary<uint, Instruction> _instructions = [];
@@ -49,6 +50,7 @@ internal sealed class FunctionAnalysis
     private readonly List<(uint Target, bool IsThumb)> _unknownTargets = [];
     private readonly Stack<(uint Address, bool IsThumb)> _pending = [];
     private readonly HashSet<Instruction> _unboundedJumpTables = [];
+    private readonly HashSet<Instruction> _inferredJumpTables = [];
     private readonly HashSet<uint> _returnAddressQueries = [];
 
     private FunctionAnalysis(Context context, Function function)
@@ -93,10 +95,12 @@ internal sealed class FunctionAnalysis
             }
 
             // A switch can be reached before another predecessor has been
-            // decoded. Retry its bound proof after those paths are available.
+            // decoded. Retry both base provenance and bounds once paths exist.
             resolved = false;
-            foreach (var instruction in analysis._unboundedJumpTables.ToArray())
+            foreach (var instruction in analysis._instructions.Values.Where(i =>
+                IsThumbRegisterDispatch(i) && analysis._flows[i.Address].Kind == FlowKind.IndirectJump).ToArray())
             {
+                if (analysis._errors.Count != 0) break;
                 if (analysis.FindJumpTable(instruction) is not { Kind: FlowKind.JumpTable } flow) continue;
                 analysis._flows[instruction.Address] = flow;
                 foreach (uint target in flow.LocalTargets) analysis.AddLabel(target, instruction.IsThumb);
@@ -104,6 +108,18 @@ internal sealed class FunctionAnalysis
             }
         }
         while (resolved);
+
+        // Decoding handlers can reveal new predecessors, including backedges.
+        // Recheck tables using the new provenance rule against the final graph.
+        foreach (var instruction in analysis._inferredJumpTables.ToArray())
+        {
+            var original = analysis._flows[instruction.Address];
+            if (analysis.FindJumpTable(instruction, recheckBase: true) is not { Kind: FlowKind.JumpTable } checkedFlow
+                || !original.Targets!.SequenceEqual(checkedFlow.Targets!))
+            {
+                analysis._errors.Add($"The inferred jump table at 0x{instruction.Address:X8} no longer has proven base provenance and bounds after decoding its handlers. Use input.computed_jumps for an explicitly verified target set.");
+            }
+        }
 
         foreach (var instruction in analysis._unboundedJumpTables)
         {
@@ -515,7 +531,7 @@ internal sealed class FunctionAnalysis
         return new Flow(FlowKind.IndirectCall, returnAddress);
     }
 
-    private Flow? FindJumpTable(Instruction movPC)
+    private Flow? FindJumpTable(Instruction movPC, bool recheckBase = false)
     {
         if (!movPC.IsThumb
             || FindWriter(movPC.Rm, movPC) is not { Opcode: Opcode.Ldr } loadEntry)
@@ -533,7 +549,7 @@ internal sealed class FunctionAnalysis
                     { Opcode: Opcode.Add, OperandKind: OperandKind.ImmediateShift, ShiftType: ShiftType.LSL, ShiftAmount: 0 } addTable => addTable,
             _ => null,
         };
-        if (addressCalculation is not { } calculation || FindTableAndIndex(calculation) is not { } table)
+        if (addressCalculation is not { } calculation || FindTableAndIndex(calculation, recheckBase) is not { } table)
         {
             return null;
         }
@@ -575,20 +591,80 @@ internal sealed class FunctionAnalysis
             targets[i] = target;
         }
 
+        if (table.ExtendedBase) _inferredJumpTables.Add(movPC);
         return new Flow(FlowKind.JumpTable, Targets: targets.Distinct().ToArray());
     }
 
-    private (Instruction LoadTable, Instruction ShiftIndex)? FindTableAndIndex(Instruction calculation)
+    private (Instruction LoadTable, Instruction ShiftIndex, bool ExtendedBase)? FindTableAndIndex(Instruction calculation, bool recheckBase)
     {
         foreach (var (table, index) in new[] { (calculation.Rn, calculation.Rm), (calculation.Rm, calculation.Rn) })
         {
-            if (FindWriter(table, calculation) is { Opcode: Opcode.Ldr, Rn: PC } loadTable && FindScaledIndex(index, calculation) is { } shiftIndex)
+            if (FindScaledIndex(index, calculation) is not { } shiftIndex) continue;
+            // Preserve the existing direct-literal recognition and bound rules.
+            // Only the new copy/loop provenance needs a final graph recheck.
+            if (!recheckBase && FindWriter(table, calculation) is { Opcode: Opcode.Ldr, Rn: PC } direct)
             {
-                return (loadTable, shiftIndex);
+                return (direct, shiftIndex, false);
             }
+            if (FindTableBase(table, calculation) is { } loadTable) return (loadTable, shiftIndex, true);
         }
 
         return null;
+    }
+
+    private Instruction? FindTableBase(byte register, Instruction before)
+    {
+        // Prove the same literal value on every decoded incoming path. Repeated
+        // states are value-preserving cycles, not evidence of a constant: at
+        // least one literal definition and no unknown entry path are required.
+        var incoming = _flows.SelectMany(pair => pair.Value.LocalTargets.Select(target =>
+            (Target: target, Instruction: _instructions[pair.Key]))).ToLookup(edge => edge.Target, edge => edge.Instruction);
+        var pending = new Stack<(uint Address, byte Register)>([(before.Address, register)]);
+        var visited = new HashSet<(uint Address, byte Register)>();
+        Instruction? definition = null;
+        uint? value = null;
+        while (pending.TryPop(out var state))
+        {
+            if (!visited.Add(state)) continue;
+            if (state.Address == Function.Address || _landingPads.Contains(state.Address)
+                || visited.Count > TableBaseStateLimit) return null;
+            var predecessors = incoming[state.Address].ToList();
+            if (TryGetInstructionBefore(state.Address, out var previous)
+                && (!_flows.TryGetValue(previous.Address, out var flow) || flow.FallsThrough(previous)))
+                predecessors.Add(previous);
+            if (predecessors.Count == 0) return null;
+
+            foreach (var instruction in predecessors)
+            {
+                if (instruction.Writes(state.Register))
+                {
+                    if (instruction.Condition != Condition.AL) return null;
+                    if (instruction is { Opcode: Opcode.Ldr, Rn: PC, OperandKind: OperandKind.Immediate,
+                        PreIndexed: true, WriteBack: false } && ReadLiteral(instruction) is { } literal)
+                    {
+                        if (value is not null && value != literal) return null;
+                        value = literal;
+                        definition = instruction;
+                        continue;
+                    }
+                    byte source;
+                    if (instruction is { Opcode: Opcode.Mov, OperandKind: OperandKind.ImmediateShift,
+                        ShiftType: ShiftType.LSL, ShiftAmount: 0 }) source = instruction.Rm;
+                    else if (instruction is { Opcode: Opcode.Add, OperandKind: OperandKind.Immediate, Immediate: 0 })
+                        source = instruction.Rn;
+                    else return null;
+                    pending.Push((instruction.Address, source));
+                    continue;
+                }
+
+                bool indirectCall = _flows.TryGetValue(instruction.Address, out var edge)
+                    && edge.Kind == FlowKind.IndirectCall;
+                if (MayChange(instruction, state.Register)
+                    || (indirectCall && (PreservedAcrossCalls & (1 << state.Register)) == 0)) return null;
+                pending.Push((instruction.Address, state.Register));
+            }
+        }
+        return definition;
     }
 
     private Instruction? FindScaledIndex(byte register, Instruction before)
