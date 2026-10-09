@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
 
 namespace GBARecomp;
 
@@ -16,6 +17,11 @@ internal readonly record struct Symbol(uint Address, uint Size, string Name, boo
 
     public static List<Symbol> ReadFile(string path)
     {
+        if (Path.GetExtension(path).Equals(".json", StringComparison.OrdinalIgnoreCase))
+        {
+            return ReadJSON(path);
+        }
+
         var symbols = new List<Symbol>();
         int lineNumber = 0;
 
@@ -40,6 +46,67 @@ internal readonly record struct Symbol(uint Address, uint Size, string Name, boo
         }
 
         return symbols;
+    }
+
+    // Target identity and package provenance are the consuming project's responsibility.
+    // This representation preserves the same ordered Symbol records as the ELF reader.
+    private static List<Symbol> ReadJSON(string path)
+    {
+        try
+        {
+            using var stream = File.OpenRead(path);
+            using var document = JsonDocument.Parse(stream);
+            var root = document.RootElement;
+            RequireProperties(root, "format", "format_version", "symbols");
+            if (root.GetProperty("format").GetString() != "gbarecomp-symbols"
+                || !root.GetProperty("format_version").TryGetInt32(out int version) || version != 1)
+            {
+                throw new InvalidDataException("Unsupported symbol JSON format or version.");
+            }
+
+            var entries = root.GetProperty("symbols");
+            if (entries.ValueKind != JsonValueKind.Array)
+            {
+                throw new InvalidDataException("Symbol JSON symbols must be an array.");
+            }
+
+            var symbols = new List<Symbol>(entries.GetArrayLength());
+            foreach (var entry in entries.EnumerateArray())
+            {
+                RequireProperties(entry, "address", "size", "name", "is_thumb");
+                if (!entry.GetProperty("address").TryGetUInt32(out uint address)
+                    || !entry.GetProperty("size").TryGetUInt32(out uint size)
+                    || entry.GetProperty("name").ValueKind != JsonValueKind.String
+                    || entry.GetProperty("name").GetString() is not { Length: > 0 } name)
+                {
+                    throw new InvalidDataException("Symbol JSON requires uint32 address/size and a nonempty name.");
+                }
+
+                bool? isThumb = entry.GetProperty("is_thumb").ValueKind switch
+                {
+                    JsonValueKind.True => true,
+                    JsonValueKind.False => false,
+                    JsonValueKind.Null => null,
+                    _ => throw new InvalidDataException("Symbol JSON is_thumb must be true, false, or null."),
+                };
+                symbols.Add(new Symbol(address, size, name, isThumb));
+            }
+
+            return symbols;
+        }
+        catch (Exception error) when (error is JsonException or InvalidOperationException or InvalidDataException)
+        {
+            throw new InvalidDataException($"{path}: invalid symbol JSON: {error.Message}", error);
+        }
+    }
+
+    private static void RequireProperties(JsonElement element, params string[] required)
+    {
+        if (element.ValueKind != JsonValueKind.Object
+            || !element.EnumerateObject().Select(property => property.Name).Order().SequenceEqual(required.Order()))
+        {
+            throw new InvalidDataException("Symbol JSON has missing, duplicate, or unknown properties.");
+        }
     }
 
     public static List<Symbol> ReadELF(byte[] elf)
